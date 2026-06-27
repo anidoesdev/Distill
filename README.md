@@ -1,151 +1,272 @@
-# EXTRACTOR
+# Distill — Scientific Paper Extractor
 
-Fine-tuned scientific paper information extractor. Beats GPT-4o-mini on structured
-extraction accuracy at a fraction of the cost per call.
+Fine-tunes **Qwen2.5-1.5B-Instruct** via knowledge distillation (GPT-4o-mini as teacher) to extract structured JSON from scientific paper abstracts. The complete pipeline — data generation, SFT, DPO alignment, quantization, and serving — runs on a consumer GPU with 4 GB VRAM.
 
 **Output schema:** `{authors, methodology, datasets_used, key_findings, limitations, statistical_tests}`
 
 ---
 
-## Architecture
+## What It Does
+
+Given the abstract or methods section of a paper:
+
+```bash
+curl -X POST http://localhost:8080/api/extract \
+  -H "Content-Type: application/json" \
+  -d '{"section_text": "We trained a transformer on ImageNet using SGD..."}'
+```
+
+Returns:
+
+```json
+{
+  "authors": ["Jane Smith", "John Doe"],
+  "methodology": "We trained a transformer with contrastive loss on paired text-image data...",
+  "datasets_used": ["ImageNet", "COCO"],
+  "key_findings": ["Achieves 87.3% top-1 accuracy", "Reduces training time by 40%"],
+  "limitations": ["Only evaluated on English-language papers"],
+  "statistical_tests": ["Student t-test", "Bootstrap 95% CI"]
+}
+```
+
+---
+
+## Pipeline
 
 ```
-Scientific Paper Section (text)
-          │
-          ▼
-┌─────────────────────┐
-│   Distillation      │  Sessions 4–5
-│   GPT-4 / Claude    │  ~2,000 (section, json) pairs
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│   Manual Audit      │  Session 6
-│   Streamlit UI      │  ~200 human-verified examples
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│   QLoRA SFT         │  Sessions 9–11
-│   Qwen2.5 / Llama   │  4-bit NF4, TRL SFTTrainer
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│   DPO Alignment     │  Sessions 15–17
-│   TRL DPOTrainer    │  1,000 preference pairs
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│   Quantization      │  Sessions 19–20
-│   AWQ / GGUF        │  Benchmark vs full precision
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│   vLLM Server       │  Session 22
-│   Continuous batch  │  Paged attention, OpenAI-compat API
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│   FastAPI Wrapper   │  Sessions 23–24
-│   /api/extract      │  Schema-constrained decoding, retry+repair
-└─────────┬───────────┘
-          │
-          ▼
-    Structured JSON
-    {authors, methodology, datasets_used,
-     key_findings, limitations, statistical_tests}
+arXiv API
+    │
+    ▼
+fetch_papers.py          2,008 raw abstracts
+    │
+    ▼
+generate_dataset.py      GPT-4o-mini teacher labels  (~$0.31 total)
+    │
+    ▼
+validate_dataset.py      1,907 clean examples (99%)
+    │
+    ▼
+create_splits.py         1,717 train / 190 val
+    │
+    ▼
+train_sft.py             QLoRA SFT on Qwen2.5-1.5B-Instruct  (loss → 0.12, ~3h)
+    │
+    ▼
+generate_preferences.py  (chosen, rejected) pairs for alignment
+    │
+    ▼
+train_dpo.py             DPO alignment  (reward margin 1.66 → 5.43)
+    │
+    ▼
+quantize_awq.py          AWQ INT4 quantization  (3.1 GB → 1.2 GB)
+    │
+    ▼
+vLLM + FastAPI           OpenAI-compatible serving API
 ```
+
+---
+
+## Architecture
+
+| Component | Choice | Why |
+|-----------|--------|-----|
+| Base model | Qwen2.5-1.5B-Instruct | Fits in 4 GB VRAM with QLoRA |
+| Fine-tuning | QLoRA SFT → DPO | Instruction-following, then preference alignment |
+| LoRA | rank 16, alpha 32, all attention + MLP layers | Standard QLoRA paper config |
+| Quantization | AWQ INT4 (awq_marlin kernel) | 3× smaller, GPU-accelerated inference |
+| Inference | vLLM with continuous batching | OpenAI-compatible, paged attention |
+| API | FastAPI with retry + repair | Schema validation, Prometheus metrics |
+| Teacher | GPT-4o-mini | Cost-efficient distillation (~$0.31 for 1,928 examples) |
 
 ---
 
 ## Repository Layout
 
 ```
-extractor/          installable Python package (training + serving share this)
-  api/              FastAPI application
-  model/            inference wrapper around vLLM
-  schemas/          Pydantic output schema with strict validation
-  utils/            structured logging, helpers
-training/           training scripts (not shipped to prod)
-  train_sft.py      QLoRA SFT with TRL SFTTrainer
-  train_dpo.py      DPO alignment with TRL DPOTrainer
-data/
-  raw/              distilled pairs from teacher model (gitignored)
-  processed/        tokenized HF Datasets (gitignored)
-  eval/             golden evaluation set, 200 human-audited examples
+extractor/
+  api/          FastAPI app — extract, batch, auth, health, repair
+  data/         Dataset utilities, splits, tokenization
+  eval/         Metrics: exact match, list F1, schema validity
+  model/        vLLM async client
+  schemas/      ExtractionResult pydantic schema
+  prompt.py     Chat template builder (ChatML format)
+  config.py     Settings via pydantic-settings + .env
+training/
+  train_sft.py          QLoRA supervised fine-tuning
+  train_dpo.py          DPO alignment
+  config.py             TrainingConfig, DPOConfig, LoRAConfig
+  config_3050.json      Overrides for 4 GB GPU
 scripts/
-  run_baseline.py   zero-shot baseline evaluation
-tests/              unit + integration + golden-output regression
+  fetch_papers.py       arXiv fetch with exponential backoff
+  generate_dataset.py   GPT-4o-mini teacher distillation
+  generate_preferences.py  DPO preference pair generation
+  validate_dataset.py
+  create_splits.py
+  prepare_dataset.py
+  export_checkpoint.py  Merge LoRA → full model
+  quantize_awq.py       AWQ INT4 quantization
+  eval_sft.py           Eval fine-tuned model
+  eval_base_model.py    Eval base model (zero-shot)
+  eval_teacher.py       Eval GPT-4o-mini baseline
+  compare_evals.py      Side-by-side comparison table
+  audit_app.py          Streamlit human-audit UI
+  run_eval_pipeline.py  End-to-end eval runner
+demo/
+  app.py        Gradio UI (mounted at /demo)
+tests/
+data/
+  eval/         Human-audited eval set (200 examples)
 ```
 
 ---
 
-## Quickstart
+## Setup
+
+Requires **WSL2** with an NVIDIA GPU (tested on RTX 3050 Laptop, 4 GB VRAM).
 
 ```bash
-# Install for development
-pip install -e ".[dev]"
+# In WSL
+python3.12 -m venv venv
+source venv/bin/activate
+pip install -e .
+```
 
-# Run API server (no model loaded — stub)
-uvicorn extractor.api.main:app --reload
+Copy `.env.example` to `.env`:
 
-# Check health
-curl http://localhost:8080/health
-
-# Run with Docker
-docker compose up
+```env
+OPENAI_API_KEY=sk-...
+VLLM_PORT=8001
+MODEL_NAME=checkpoints/dpo-awq
+MAX_NEW_TOKENS=300
 ```
 
 ---
 
-## Session Log
+## Running the Full Pipeline
 
-| Session | Date       | Status | Deliverable                                      |
-|---------|------------|--------|--------------------------------------------------|
-| 1       | 2026-03-02 | ✓      | Project scaffold, Dockerfile, README             |
-| 2       | 2026-03-03 | ✓      | Base model loaded, tokenizer, inference baseline |
-| 3       | 2026-03-04 | ✓      | Output schema, extraction prompt, zero-shot eval |
-| 4       | 2026-03-06 | ✓      | Teacher distillation — 2,000 examples            |
-| 5       | 2026-03-07 | ✓      | Data validation pipeline                         |
-| 6       | 2026-03-08 | ✓      | Manual audit Streamlit tool                      |
-| 7       | 2026-03-10 | ✓      | Train/val/test split, data card                  |
-| 8       | 2026-03-12 | ✓      | HF Datasets, tokenization, sequence analysis     |
-| 9       | 2026-03-15 | ✓      | QLoRA SFT script + training config               |
-| 10      | 2026-03-16 | ✓      | Smoke-test SFT run, loss curves                  |
-| 11      | 2026-03-17 | ✓      | Full SFT run, W&B logging, checkpoint export     |
-| 12      | 2026-03-20 | ✓      | Eval script, per-field EM + F1 metrics           |
-| 13      | 2026-03-24 | ✓      | SFT vs base vs GPT-4o-mini comparison            |
-| 14      | 2026-03-30 | ✓      | Buffer — polish, env checker, clean exports      |
-| 15      | 2026-03-31 | ✓      | DPO theory, Bradley-Terry, loss derivation       |
-| 16      | 2026-04-01 | ✓      | Preference dataset — 1,000 pairs                 |
-| 17      | 2026-04-05 | ✓      | DPO training run, reward margins                 |
-| 18      | 2026-04-07 | ✓      | DPO eval, alignment tax analysis                 |
-| 19      | 2026-04-08 | ✓      | Quantization theory, AWQ/GGUF                    |
-| 20      | 2026-04-10 | ✓      | Quantized vs full-precision benchmark            |
-| 21      | 2026-04-11 | ✓      | Model card                                       |
-| 22      | 2026-04-16 | ✓      | vLLM serving, continuous batching                |
-| 23      | 2026-04-18 | ✓      | FastAPI wrapper, auth, logging, retry+repair     |
-| 24      | 2026-04-20 | ✓      | Schema-constrained decoding (outlines)           |
-| 25      | 2026-04-21 | ✓      | Integration into scientific-rag-assistant        |
-| 26      | 2026-04-23 | ✓      | Frontend — "Extract Structure" button            |
-| 27      | 2026-04-25 | ✓      | Tests — unit, integration, regression            |
-| 28      | 2026-04-26 | ✓      | Cost + latency benchmark report                  |
-| 29      | 2026-04-30 | ✓      | Production polish — health, Prometheus, runbook  |
-| 30      | 2026-05-01 | ✓      | Mock interview — defend all decisions            |
+### 1. Data collection and distillation
+
+```bash
+python scripts/fetch_papers.py
+python scripts/generate_dataset.py      # calls GPT-4o-mini ~$0.31
+python scripts/validate_dataset.py
+python scripts/create_splits.py
+python scripts/prepare_dataset.py
+```
+
+### 2. Training
+
+```bash
+# SFT — ~3 hours on RTX 3050
+python training/train_sft.py --config training/config_3050.json
+
+# Export + quantize
+python scripts/export_checkpoint.py
+python scripts/quantize_awq.py
+
+# Generate preference pairs and run DPO — ~1 hour on RTX 3050
+python scripts/generate_preferences.py
+python training/train_dpo.py --config training/config_dpo_3050.json
+```
+
+### 3. Serving
+
+```bash
+# Terminal 1 — vLLM
+vllm serve checkpoints/dpo-awq \
+  --quantization awq_marlin \
+  --dtype float16 \
+  --max-model-len 768 \
+  --gpu-memory-utilization 0.95 \
+  --enforce-eager --swap-space 0 --max-num-seqs 4 \
+  --port 8001
+
+# Terminal 2 — extractor API
+uvicorn extractor.api.main:app --host 0.0.0.0 --port 8080
+```
+
+Or: `bash start.sh`
+
+### 4. Evaluate
+
+```bash
+# Label 200 examples in a browser UI
+streamlit run scripts/audit_app.py
+
+# Run eval suite
+python scripts/eval_sft.py --model-dir checkpoints/sft --adapter
+python scripts/eval_base_model.py
+python scripts/compare_evals.py
+```
 
 ---
 
-## Model Candidates
+## API Reference
 
-| Model                  | Params | VRAM (4-bit) | Notes                              |
-|------------------------|--------|--------------|------------------------------------|
-| Qwen2.5-1.5B-Instruct  | 1.5B   | ~2 GB        | Fastest iteration, fits on Colab   |
-| Qwen2.5-3B-Instruct    | 3B     | ~3 GB        | Better reasoning, still fast       |
-| Llama-3.2-3B-Instruct  | 3B     | ~3 GB        | Strong instruction following       |
-| Phi-3.5-mini-instruct  | 3.8B   | ~4 GB        | Highest quality, slowest           |
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/health` | No | Liveness check |
+| GET | `/health/ready` | No | Readiness — checks vLLM |
+| GET | `/metrics` | No | Prometheus metrics |
+| GET | `/api/info` | Yes | Model config + vLLM status |
+| POST | `/api/extract` | Yes | Extract from one section |
+| POST | `/api/extract/batch` | Yes | Batch extraction (up to 20) |
+| GET | `/demo` | No | Gradio interactive UI |
 
-Final choice made in Session 2 based on zero-shot baseline results.
+**Request:**
+```json
+{ "section_text": "...", "max_tokens": 512 }
+```
+
+**Response:**
+```json
+{
+  "extraction": { ... },
+  "parse_error": null,
+  "repair_attempted": false,
+  "latency_s": 0.84,
+  "prompt_tokens": 312,
+  "completion_tokens": 147
+}
+```
+
+---
+
+## Results
+
+Fine-tuned DPO model vs base Qwen2.5-1.5B (190 val examples):
+
+| Field | Base F1 | Fine-tuned F1 | Delta |
+|-------|---------|---------------|-------|
+| key_findings | 49.2% | 65.9% | **+16.7%** |
+| methodology (EM) | 18.9% | 28.4% | **+9.5%** |
+| schema_validity | 96.3% | 99.5% | **+3.2%** |
+
+> Sparse fields (limitations, statistical_tests) show inflated base scores due to empty-list bias — the base model outputs empty lists that match mostly-empty references.
+
+Model size after AWQ INT4 quantization: **1.2 GB** (down from 3.1 GB merged BF16).
+
+---
+
+## Hardware Requirements
+
+| Phase | Min VRAM | Config used |
+|-------|----------|-------------|
+| SFT training | 4 GB | batch=2, grad_accum=8, QLoRA NF4 |
+| DPO training | 4 GB | batch=1, grad_accum=16, precompute_ref_log_probs |
+| AWQ quantization | 4 GB | 128 calibration samples, seq_len=512 |
+| Serving | 4 GB | awq_marlin, max-model-len=768, enforce-eager |
+
+---
+
+## Dependencies
+
+Core: `transformers>=4.51`, `trl`, `peft`, `bitsandbytes`, `vllm==0.8.3`, `autoawq`, `fastapi`, `pydantic-settings`, `datasets`, `httpx`
+
+See [requirements.txt](requirements.txt) for pinned versions.
+
+---
+
+## License
+
+MIT
