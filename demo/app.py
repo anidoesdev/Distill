@@ -88,21 +88,11 @@ async def _run_extraction(section_text: str, max_tokens: int) -> tuple[str, str,
     return formatted_out, raw, status
 
 
-def _sync_extract(section_text: str, max_tokens: int) -> tuple[str, str, str]:
-    """Sync wrapper for Gradio (which runs fn in a thread pool)."""
-    import asyncio
-
+async def _extract(section_text: str, max_tokens: int) -> tuple[str, str, str]:
+    """Async click handler. Gradio awaits it on its own event loop, so no
+    worker-thread loop juggling is needed (that fails on Python 3.12)."""
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Already inside an event loop (e.g., Jupyter) — use nest_asyncio
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(
-                    asyncio.run, _run_extraction(section_text, max_tokens)
-                )
-                return future.result()
-        return loop.run_until_complete(_run_extraction(section_text, max_tokens))
+        return await _run_extraction(section_text, max_tokens)
     except Exception as exc:
         logger.exception("extraction failed in demo")
         empty = ExtractionResult()
@@ -174,7 +164,7 @@ def build_demo() -> gr.Blocks:
                         )
 
         extract_btn.click(
-            fn=_sync_extract,
+            fn=_extract,
             inputs=[section_input, max_tokens_slider],
             outputs=[formatted_output, json_output, status_box],
         )
